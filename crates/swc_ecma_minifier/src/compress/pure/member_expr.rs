@@ -338,7 +338,8 @@ impl Pure<'_> {
             Expr::Lit(Lit::Str(Str { value, span, .. })) => {
                 match op.index {
                     Some(index) => {
-                        if index >= value.len() {
+                        // JavaScript indexes strings by UTF-16 code unit, not by WTF-8 byte.
+                        if value.to_ill_formed_utf16().nth(index).is_none() {
                             Some(*Expr::undefined(*span))
                         } else {
                             // idx is in bounds, this is handled in simplify

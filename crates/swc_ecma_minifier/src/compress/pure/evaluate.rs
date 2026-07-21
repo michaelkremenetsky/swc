@@ -1,3 +1,5 @@
+use std::num::FpCategory;
+
 use radix_fmt::Radix;
 use swc_atoms::atom;
 use swc_common::{util::take::Take, Spanned, SyntaxContext};
@@ -5,7 +7,7 @@ use swc_ecma_ast::*;
 use swc_ecma_utils::{
     number::{parse_canonical_index, ToJsString},
     unicode::{is_high_surrogate, is_low_surrogate},
-    ExprExt, IsEmpty, Type, Value,
+    ExprCtx, ExprExt, IsEmpty, Type, Value,
 };
 
 use super::Pure;
@@ -18,6 +20,65 @@ use crate::{
     },
     util::ValueExt,
 };
+
+/// Applies ECMAScript's `ToIntegerOrInfinity` operation to a known number.
+///
+/// https://tc39.es/ecma262/multipage/abstract-operations.html#sec-tointegerorinfinity
+fn to_integer_or_infinity(value: f64) -> f64 {
+    // Step 1 (`ToNumber`) is already satisfied by the `f64` input.
+    // 2. If number is one of NaN, +0𝔽, or -0𝔽, return 0.
+    // 3. If number is +∞𝔽, return +∞.
+    // 4. If number is -∞𝔽, return -∞.
+    // 5. Return truncate(ℝ(number)).
+    match value.classify() {
+        FpCategory::Nan | FpCategory::Zero => 0.0,
+        FpCategory::Infinite => value,
+        _ => value.trunc(),
+    }
+}
+
+/// Converts a known string-method argument to a host-addressable UTF-16 index.
+///
+/// Values outside this range are necessarily out of bounds for a string held
+/// by the current process, so callers can produce the method's out-of-bounds
+/// result without narrowing through a platform-dependent integer cast.
+fn to_string_index(value: f64) -> Option<usize> {
+    let index = to_integer_or_infinity(value);
+    let addressable = 0.0..usize::MAX as f64;
+
+    if !addressable.contains(&index) {
+        return None;
+    }
+
+    Some(index as usize)
+}
+
+enum KnownStringIndex {
+    Addressable(usize),
+    OutOfBounds,
+}
+
+/// Evaluates the index argument shared by `charCodeAt` and `codePointAt`.
+///
+/// `None` means the call cannot be folded without changing observable effects;
+/// `OutOfBounds` is a known index that cannot address the current string.
+fn known_string_index(args: &[ExprOrSpread], expr_ctx: ExprCtx) -> Option<KnownStringIndex> {
+    let value = match args {
+        [] => 0.0,
+        [arg] if arg.spread.is_none() && !arg.expr.may_have_side_effects(expr_ctx) => {
+            let Value::Known(value) = arg.expr.as_pure_number(expr_ctx) else {
+                return None;
+            };
+            value
+        }
+        _ => return None,
+    };
+
+    Some(match to_string_index(value) {
+        Some(index) => KnownStringIndex::Addressable(index),
+        None => KnownStringIndex::OutOfBounds,
+    })
+}
 
 impl Pure<'_> {
     ///
@@ -839,110 +900,89 @@ impl Pure<'_> {
             "toLowerCase" => s.value.to_lowercase(),
             "toUpperCase" => s.value.to_uppercase(),
             "charCodeAt" => {
-                if call.args.len() != 1 {
+                let Some(index) = known_string_index(&call.args, self.expr_ctx) else {
                     return;
-                }
-                if let Expr::Lit(Lit::Num(Number { value, .. })) = &*call.args[0].expr {
-                    if value.fract() != 0.0 {
-                        return;
+                };
+
+                let code_unit = match index {
+                    KnownStringIndex::Addressable(index) => {
+                        s.value.to_ill_formed_utf16().nth(index)
                     }
+                    KnownStringIndex::OutOfBounds => None,
+                };
 
-                    let idx = value.round() as i64 as usize;
-                    let c = s.value.to_ill_formed_utf16().nth(idx);
-
-                    match c {
-                        Some(v) => {
-                            self.changed = true;
-                            report_change!(
-                                "evaluate: Evaluated `charCodeAt` of a string literal as `{}`",
-                                v
-                            );
-                            *e = Lit::Num(Number {
-                                span: call.span,
-                                value: v as usize as f64,
-                                raw: None,
-                            })
-                            .into()
-                        }
-                        None => {
-                            self.changed = true;
-                            report_change!(
-                                "evaluate: Evaluated `charCodeAt` of a string literal as `NaN`",
-                            );
-                            *e = Ident::new(atom!("NaN"), e.span(), SyntaxContext::empty()).into()
-                        }
+                self.changed = true;
+                match code_unit {
+                    Some(code_unit) => {
+                        report_change!(
+                            "evaluate: Evaluated `charCodeAt` of a string literal as `{}`",
+                            code_unit
+                        );
+                        *e = Lit::Num(Number {
+                            span: call.span,
+                            value: f64::from(code_unit),
+                            raw: None,
+                        })
+                        .into();
+                    }
+                    None => {
+                        report_change!(
+                            "evaluate: Evaluated `charCodeAt` of a string literal as `NaN`",
+                        );
+                        *e = Ident::new(
+                            atom!("NaN"),
+                            e.span(),
+                            SyntaxContext::empty().apply_mark(self.marks.unresolved_mark),
+                        )
+                        .into();
                     }
                 }
                 return;
             }
             "codePointAt" => {
-                if call.args.len() != 1 {
+                let Some(index) = known_string_index(&call.args, self.expr_ctx) else {
                     return;
-                }
-                if let Expr::Lit(Lit::Num(Number { value, .. })) = &*call.args[0].expr {
-                    if value.fract() != 0.0 {
-                        return;
-                    }
+                };
 
-                    let idx = value.round() as i64 as usize;
-                    let mut c = s.value.to_ill_formed_utf16().skip(idx).peekable();
-                    match c.next() {
-                        Some(v) => {
-                            match (v, c.peek()) {
-                                (high, Some(&low))
-                                    if is_high_surrogate(high as u32)
-                                        && is_low_surrogate(low as u32) =>
-                                {
-                                    // Decode surrogate pair
-                                    let code_point = swc_ecma_utils::unicode::pair_to_code_point(
-                                        high as u32,
-                                        low as u32,
-                                    );
-                                    self.changed = true;
-                                    report_change!(
-                                        "evaluate: Evaluated `codePointAt` of a string literal as \
-                                         `{}`",
-                                        code_point
-                                    );
-                                    *e = Lit::Num(Number {
-                                        span: call.span,
-                                        value: code_point as f64,
-                                        raw: None,
-                                    })
-                                    .into();
-                                    return;
-                                }
-                                _ => {
-                                    // Not a surrogate pair
-                                    self.changed = true;
-                                    report_change!(
-                                        "evaluate: Evaluated `codePointAt` of a string literal as \
-                                         `{}`",
-                                        v
-                                    );
-                                    *e = Lit::Num(Number {
-                                        span: call.span,
-                                        value: v as usize as f64,
-                                        raw: None,
-                                    })
-                                    .into()
-                                }
-                            }
-                        }
-                        None => {
-                            self.changed = true;
-                            report_change!(
-                                "evaluate: Evaluated `codePointAt` of a string literal as `NaN`",
-                            );
-                            *e = Ident::new(
-                                atom!("NaN"),
-                                e.span(),
-                                SyntaxContext::empty().apply_mark(self.marks.unresolved_mark),
-                            )
-                            .into()
-                        }
+                let KnownStringIndex::Addressable(index) = index else {
+                    self.changed = true;
+                    report_change!(
+                        "evaluate: Evaluated `codePointAt` of a string literal as `undefined`",
+                    );
+                    *e = *Expr::undefined(call.span);
+                    return;
+                };
+
+                let mut code_units = s.value.to_ill_formed_utf16().skip(index).peekable();
+                let Some(first) = code_units.next() else {
+                    self.changed = true;
+                    report_change!(
+                        "evaluate: Evaluated `codePointAt` of a string literal as `undefined`",
+                    );
+                    *e = *Expr::undefined(call.span);
+                    return;
+                };
+
+                let code_point = match (first, code_units.peek()) {
+                    (high, Some(&low))
+                        if is_high_surrogate(high.into()) && is_low_surrogate(low.into()) =>
+                    {
+                        swc_ecma_utils::unicode::pair_to_code_point(high.into(), low.into())
                     }
-                }
+                    _ => first.into(),
+                };
+
+                self.changed = true;
+                report_change!(
+                    "evaluate: Evaluated `codePointAt` of a string literal as `{}`",
+                    code_point
+                );
+                *e = Lit::Num(Number {
+                    span: call.span,
+                    value: f64::from(code_point),
+                    raw: None,
+                })
+                .into();
                 return;
             }
             _ => return,
